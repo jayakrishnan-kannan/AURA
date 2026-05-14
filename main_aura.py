@@ -1,53 +1,113 @@
-import pyaudio  
-
+import pyaudio
+import sys
+import select
 from picamera2 import Picamera2
 import cv2
 import threading
 import time
 import os
 import json
-import subprocess 
+import subprocess
 from vosk import Model, KaldiRecognizer
-import wave
+from groq import Groq
 
-# ── Constants ──────────────────────────────────────────
-DISPLAY_W, DISPLAY_H = 800, 480
+# ── Constants & API Configuration ─────────────────────
+DISPLAY_W, DISPLAY_H = 800, 400
 CASCADE_PATH = "/home/aura/AURA/model/haarcascade_frontalface_default.xml"
-MODEL_PATH   = "/home/aura/AURA/model/vosk-model-small-en-in-0.4"
-PIPE_PATH    = "/home/aura/AURA/ssh_bridge.pipe"
+MODEL_PATH = "/home/aura/AURA/model/vosk-model-small-en-in-0.4"
+PIPE_PATH = "/home/aura/AURA/ssh_bridge.pipe"
 
+GROQ_API_KEY = ""
 COMMANDS = {
-    "forward":  "move_forward",
-    "back":     "move_backward",
-    "left":     "turn_left",
-    "right":    "turn_right",
-    "stop":     "stop_motors",
+    "forward": "move_forward",
+    "back": "move_backward",
+    "left": "turn_left",
+    "right": "turn_right",
+    "stop": "stop_motors",
 }
 
 # ── Shared state ───────────────────────────────────────
 state = {
-    "faces":          [],
-    "heard_text":     "",
-    "response_text":  "",
-    "status":         "Initializing...",
-    "greeted":        False,   
-    "speaking":       False,    
-    "face_lost_time": None,    
+    "faces": [],
+    "heard_text": "",
+    "response_text": "",
+    "status": "Initializing...",
+    "greeted": False,
+    "speaking": False,
+    "display_active": False,  # 👈 CRITICAL FIX: Locks HUD visibility at frame level
+    "face_lost_time": None,
 }
 state_lock = threading.Lock()
 
-# ── Centralized Execution & Screen Management ─────────
+
+# ── Synchronous Hard-Blocking TTS Engine ───────────────
+def speak_blocking(text):
+    try:
+        p1 = subprocess.Popen(
+            ["espeak", "-s", "160", text, "--stdout"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        p2 = subprocess.Popen(
+            ["aplay"],
+            stdin=p1.stdout,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        p1.stdout.close()
+        p2.communicate()
+    except Exception as e:
+        print(f"Audio Output Error: {e}")
+
+
+# ── Asynchronous Background TTS (For Greetings) ────────
+def speak(text):
+    def _speak_task():
+        with state_lock:
+            state["speaking"] = True
+            state["display_active"] = True
+        speak_blocking(text)
+        with state_lock:
+            state["speaking"] = False
+            state["display_active"] = False
+            state["heard_text"] = ""
+            state["response_text"] = ""
+
+    threading.Thread(target=_speak_task, daemon=True).start()
+
+
+# ── Free Groq Cloud Gateway ───────────────────────────
+def ask_ai_brain(question):
+
+    try:
+        client = Groq(api_key=GROQ_API_KEY)
+        completion = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are AURA, a smart visual robot assistant. Give short answers under 12 words.",
+                },
+                {"role": "user", "content": question},
+            ],
+            timeout=10.0,
+        )
+        return completion.choices[0].message.content.strip()
+    except Exception as e:
+        print("Groq Error:", repr(e))
+        return f"Brain Error: {e}"
+
+
+# ── Centralized Text Display Engine ────────────────────
 def process_text_command(text_input, source_type="Input"):
-    """
-    Unified text matching logic. Overwrites old text on the LCD, 
-    speaks via espeak, and wipes the display clear when talking finishes.
-    """
     if not text_input:
         return
 
-    # 1. Instantly overwrite old text responses and push new input onto LCD
+    # 1. Open the HUD and project the text immediately
     with state_lock:
         state["heard_text"] = f"{source_type}: {text_input}"
+        state["response_text"] = "Thinking..."
+        state["display_active"] = True
 
     matched = None
     for keyword, action in COMMANDS.items():
@@ -59,59 +119,51 @@ def process_text_command(text_input, source_type="Input"):
         response = matched.replace("_", " ")
         with state_lock:
             state["response_text"] = f"CMD: {response}"
-        
-        # Lock camera greeting execution during action speech
-        with state_lock:
             state["speaking"] = True
-        
-        # Synchronous audio processing
-        subprocess.run(["espeak", "-s", "150", response], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        
+
+        # Hold state lock during audio execution
+        speak_blocking(response)
+
         with state_lock:
             state["speaking"] = False
-            # Clear text arrays immediately after speaking finishes
-            state["heard_text"] = ""
-            state["response_text"] = ""
-            
-        execute_command(matched)
-    else:
-        with state_lock:
-            state["response_text"] = "Unknown command"
-        
-        with state_lock:
-            state["speaking"] = True
-            
-        subprocess.run(["espeak", "-s", "150", "Command not recognized"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        
-        with state_lock:
-            state["speaking"] = False
-            # Clear text error displays immediately
+            state["display_active"] = False  # 👈 Clear screen ONLY after voice finishes
             state["heard_text"] = ""
             state["response_text"] = ""
 
-# ── Optimized Ultra-Lightweight TTS ─────────────────────
-def speak(text):
-    def _speak_task():
+        execute_command(matched)
+    else:
+        ai_response = ask_ai_brain(text_input)
+
         with state_lock:
+            state["response_text"] = ai_response
             state["speaking"] = True
-        subprocess.run(["espeak", "-s", "150", text], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # Enforce minimum display duration safety timer
+        start_time = time.time()
+        speak_blocking(ai_response)
+        elapsed = time.time() - start_time
+
+        if elapsed < 2.5:
+            time.sleep(2.5 - elapsed)
+
         with state_lock:
             state["speaking"] = False
-    threading.Thread(target=_speak_task, daemon=True).start()
+            state["display_active"] = False  # 👈 Clear screen ONLY after voice finishes
+            state["heard_text"] = ""
+            state["response_text"] = ""
+
 
 def handle_greeting(face_count):
     with state_lock:
-        greeted    = state["greeted"]
-        speaking   = state["speaking"]  
-        lost_time  = state["face_lost_time"]
+        greeted = state["greeted"]
+        speaking = state["speaking"]
 
     if face_count > 0:
         with state_lock:
             state["face_lost_time"] = None
-
         if not greeted and not speaking:
             with state_lock:
-                state["greeted"]       = True
+                state["greeted"] = True
                 state["response_text"] = "Hello! I am AURA"
             speak("Hello! I am AURA")
     else:
@@ -123,103 +175,175 @@ def handle_greeting(face_count):
 
         if lost_since > 3.0:
             with state_lock:
-                state["greeted"]       = False
-                state["response_text"] = ""
+                state["greeted"] = False
+                if not state["display_active"]:
+                    state["response_text"] = ""
 
-# ── Voice thread (Active Output Tracker) ───────────────
+
+# ── Input Streams Thread Pools ────────────────────────
 def voice_thread():
-    time.sleep(2)  
-
+    time.sleep(2)
     try:
         model = Model(MODEL_PATH)
-        rec   = KaldiRecognizer(model, 16000)
+        rec = KaldiRecognizer(model, 16000)
         p = pyaudio.PyAudio()
         stream = p.open(
-            format=pyaudio.paInt16, channels=1, rate=16000,
-            input=True, frames_per_buffer=4000  
+            format=pyaudio.paInt16,
+            channels=1,
+            rate=16000,
+            input=True,
+            frames_per_buffer=4000,
         )
     except Exception as e:
-        # Graceful microphone detection bypass so your system does not crash without a mic
         with state_lock:
             state["status"] = "SSH Only Mode"
-        print(f"⚠️ Microphone offline or missing: {e}. Remote SSH mode active.")
         while True:
             time.sleep(1)
 
     with state_lock:
         state["status"] = "AURA Listening"
-
     while True:
         try:
             data = stream.read(4000, exception_on_overflow=False)
         except IOError:
             continue
-
         if len(data) == 0:
             continue
-
         if rec.AcceptWaveform(data):
             result = json.loads(rec.Result())
-            text   = result.get("text", "").lower().strip()
-
+            text = result.get("text", "").lower().strip()
             if text:
                 process_text_command(text, source_type="Voice")
 
-# ── Zero-Resource SSH Optional Listener Thread ────────
+
 def optional_ssh_thread():
-    """
-    Blocks cleanly on the OS file system layer using a Linux Pipe.
-    Consumes 0% CPU and 0 MB RAM when no one is using SSH.
-    """
-    print("🖥️ Background SSH Monitor Initialized (Zero-Overhead).")
-    
     while True:
-        # Opening a named pipe blocks execution until data enters the channel
         with open(PIPE_PATH, "r") as fifo:
             for line in fifo:
                 clean_command = line.strip().lower()
                 if clean_command:
-                    # Pass incoming terminal inputs directly to screen layout execution
                     process_text_command(clean_command, source_type="SSH")
 
-# ── Draw overlay on frame ──────────────────────────────
-def draw_overlay(frame, faces, heard, response, status):
+
+# ── Micro-HUD Display Overlay Engine (1/6th Height) ────
+def draw_multiline_text(
+    frame, text, start_x, start_y, max_width, line_height, font, scale, color, thickness
+):
+    words = text.split(" ")
+    current_line = ""
+    y = start_y
+
+    for word in words:
+        test_line = current_line + word + " "
+        (line_w, _), _ = cv2.getTextSize(test_line, font, scale, thickness)
+
+        if line_w > max_width and current_line:
+            cv2.putText(
+                frame,
+                current_line.strip(),
+                (start_x, y),
+                font,
+                scale,
+                color,
+                thickness,
+                cv2.LINE_AA,
+            )
+            current_line = word + " "
+            y += line_height
+        else:
+            current_line = test_line
+
+    if current_line:
+        cv2.putText(
+            frame,
+            current_line.strip(),
+            (start_x, y),
+            font,
+            scale,
+            color,
+            thickness,
+            cv2.LINE_AA,
+        )
+
+
+def draw_overlay(frame, faces, heard, response, status, display_active):
     h, w = frame.shape[:2]
 
-    for (x, y, fw, fh) in faces:
-        cv2.rectangle(frame, (x, y), (x+fw, y+fh), (0, 255, 0), 2)
-        cv2.putText(frame, "Face", (x, y - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+    # Target Tracking Boxes
+    for x, y, fw, fh in faces:
+        cv2.rectangle(frame, (x, y), (x + fw, y + fh), (0, 255, 0), 2)
+        cv2.putText(
+            frame,
+            "Target",
+            (x, y - 6),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.4,
+            (0, 255, 0),
+            1,
+            cv2.LINE_AA,
+        )
 
-    # Status box background
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (0, h - 80), (w, h), (0, 0, 0), -1)
-    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+    # 👈 FIX: Evaluate display_active barrier state explicitly
+    if display_active or heard or response:
+        hud_h = 80
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (0, h - hud_h), (w, h), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.65, frame, 0.35, 0, frame)
 
-    if heard:
-        cv2.putText(frame, heard, (10, h - 50),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1, cv2.LINE_AA)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        text_scale = 0.48
+        text_thick = 1
 
-    if response:
-        cv2.putText(frame, response, (10, h - 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
+        if heard:
+            cv2.putText(
+                frame,
+                heard,
+                (15, h - 60),
+                font,
+                text_scale,
+                (0, 255, 255),
+                text_thick,
+                cv2.LINE_AA,
+            )
 
-    cv2.putText(frame, status, (w - 180, 25),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
+        if response:
+            draw_multiline_text(
+                frame=frame,
+                text=response,
+                start_x=15,
+                start_y=h - 38,
+                max_width=770,
+                line_height=18,
+                font=font,
+                scale=text_scale,
+                color=(0, 255, 0),
+                thickness=text_thick + 1,
+            )
 
-    face_label = f"Faces: {len(faces)}"
-    cv2.putText(frame, face_label, (10, 25),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 1, cv2.LINE_AA)
-
+    # Top Status Text Headers
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    cv2.putText(
+        frame, status, (w - 150, 20), font, 0.42, (200, 200, 200), 1, cv2.LINE_AA
+    )
+    cv2.putText(
+        frame,
+        f"Trackers: {len(faces)}",
+        (15, 20),
+        font,
+        0.42,
+        (255, 255, 0),
+        1,
+        cv2.LINE_AA,
+    )
     return frame
+
 
 def execute_command(action):
     print(f"Motor Action Triggered: {action}")
 
-# ── Camera + display (main thread) ────────────────────
+
 def main():
     face_cascade = cv2.CascadeClassifier(CASCADE_PATH)
-
     picam2 = Picamera2()
     config = picam2.create_preview_configuration(
         main={"size": (320, 240), "format": "RGB888"}
@@ -232,55 +356,51 @@ def main():
     cv2.resizeWindow("AURA", DISPLAY_W, DISPLAY_H)
     cv2.setWindowProperty("AURA", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
-    # Start Voice Listener
-    t_voice = threading.Thread(target=voice_thread, daemon=True)
-    t_voice.start()
-
-    # Start Zero-Resource SSH Listener
-    t_ssh = threading.Thread(target=optional_ssh_thread, daemon=True)
-    t_ssh.start()
+    threading.Thread(target=voice_thread, daemon=True).start()
+    threading.Thread(target=optional_ssh_thread, daemon=True).start()
 
     with state_lock:
-        state["status"] = "AURA Active"
-
+        state["status"] = "System Online"
     frame_count = 0
-    local_faces = [] 
+    local_faces = []
 
     while True:
         frame = picam2.capture_array()
-     
 
         if frame_count % 5 == 0:
-            gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             detected_boxes = face_cascade.detectMultiScale(
-                gray, scaleFactor=1.3,
-                minNeighbors=5, minSize=(30, 30)
+                gray, scaleFactor=1.3, minNeighbors=5, minSize=(30, 30)
             )
-            local_faces = [tuple(b) for b in detected_boxes] if len(detected_boxes) > 0 else []
-            
+            local_faces = (
+                [tuple(b) for b in detected_boxes] if len(detected_boxes) > 0 else []
+            )
             with state_lock:
                 state["faces"] = local_faces
-
             handle_greeting(len(local_faces))
             frame_count = 0
         frame_count += 1
 
+        # Atomically snap all layout states together
         with state_lock:
-            heard    = state["heard_text"]
+            heard = state["heard_text"]
             response = state["response_text"]
-            status   = state["status"]
+            status = state["status"]
+            display_active = state["display_active"]  # 👈 NEW: Synchronized flag map
 
-        frame = draw_overlay(frame, local_faces, heard, response, status)
-
-        display_frame = cv2.resize(frame, (DISPLAY_W, DISPLAY_H), interpolation=cv2.INTER_LINEAR)
+        frame = draw_overlay(
+            frame, local_faces, heard, response, status, display_active
+        )
+        display_frame = cv2.resize(
+            frame, (DISPLAY_W, DISPLAY_H), interpolation=cv2.INTER_LINEAR
+        )
         cv2.imshow("AURA", display_frame)
-
-        if cv2.waitKey(25) & 0xFF == ord('q'):
+        if cv2.waitKey(25) & 0xFF == ord("q"):
             break
 
     cv2.destroyAllWindows()
     picam2.stop()
 
+
 if __name__ == "__main__":
     main()
-
