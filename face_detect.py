@@ -4,7 +4,7 @@ import time
 
 # Load face detector
 face_cascade = cv2.CascadeClassifier(
-    "/home/pi/AURA/model/haarcascade_frontalface_default.xml"
+    "/home/aura/AURA/models/haarcascade_frontalface_default.xml"
 )
 
 picam2 = Picamera2()
