@@ -18,15 +18,21 @@ CASCADE_PATH = "/home/aura/AURA/model/haarcascade_frontalface_default.xml"
 MODEL_PATH = "/home/aura/AURA/model/vosk-model-small-en-in-0.4"
 PIPE_PATH = "/home/aura/AURA/ssh_bridge.pipe"
 
+# Production Groq API Key
 GROQ_API_KEY = ""
 
-# ── Motor GPIO Pin Map (BCM numbering) ─────────────────
+# ── Motor GPIO Pin Map (BCM Numbering) ─────────────────
 MOTOR_PINS = {
     "left_front": {"in1": 5, "in2": 6},
     "left_rear": {"in1": 12, "in2": 13},
     "right_front": {"in1": 19, "in2": 16},
     "right_rear": {"in1": 26, "in2": 20},
 }
+
+# ── Ultrasonic Sensor GPIO Pin Map (BCM Numbering) ─────
+TRIG_PIN = 27
+ECHO_PIN = 17
+OBSTACLE_THRESHOLD_CM = 20.0  # Stop distance threshold
 
 # ── Voice / SSH Command Map ────────────────────────────
 COMMANDS = {
@@ -47,88 +53,273 @@ state = {
     "speaking": False,
     "display_active": False,
     "face_lost_time": None,
-    "scroll_offset": 0,  # Tracks lines shifting upwards for long responses
+    "scroll_offset": 0,
 }
 state_lock = threading.Lock()
 
+# ── Globals for Motor Tracking Across Threads ──────────
+pwm_objects = {}
+current_speed = 0
+current_dir_left = "stop"
+current_dir_right = "stop"
+ramp_lock = threading.Lock()
+
+# ── Ultrasonic Watchdog State Trackers ────────────────
+last_intended_command = "stop_motors"
+obstacle_blocked = False
+
 # ══════════════════════════════════════════════════════
-# GPIO MOTOR CONTROL
+# ADVANCED POWER-MANAGED MOTOR CONTROL (PWM RAMPING)
 # ══════════════════════════════════════════════════════
 
 
 def gpio_setup():
     """
-    Initialize all motor GPIO pins. Called once at main startup loop.
+    Initialises physical pins and attaches PWM frequencies at a silent 1kHz.
+    Called once inside the main() startup block.
     """
     GPIO.setmode(GPIO.BCM)
     GPIO.setwarnings(False)
+
+    global pwm_objects
     for motor, pins in MOTOR_PINS.items():
         GPIO.setup(pins["in1"], GPIO.OUT)
         GPIO.setup(pins["in2"], GPIO.OUT)
-    _all_stop()
-    print("⚙️ GPIO Motor Pins Successfully Initialised (BCM Mode Registered).")
+
+        # Spawn isolated PWM channels per pin input lane
+        pwm_objects[f"{motor}_in1"] = GPIO.PWM(pins["in1"], 1000)
+        pwm_objects[f"{motor}_in2"] = GPIO.PWM(pins["in2"], 1000)
+
+        pwm_objects[f"{motor}_in1"].start(0)
+        pwm_objects[f"{motor}_in2"].start(0)
+
+    # Setup Ultrasonic Pins
+    GPIO.setup(TRIG_PIN, GPIO.OUT)
+    GPIO.setup(ECHO_PIN, GPIO.IN)
+    GPIO.output(TRIG_PIN, GPIO.LOW)
+
+    print("⚙️ PWM Matrix & Ultrasonic Sensor Initialised Successfully.")
 
 
 def gpio_cleanup():
     """
     Safe cleanup — stops all motors and releases GPIO configurations on exit.
     """
-    _all_stop()
+    global current_speed, current_dir_left, current_dir_right
+    current_speed = 0
+    current_dir_left = "stop"
+    current_dir_right = "stop"
+    _update_all_wheels(0)
     GPIO.cleanup()
     print("🧹 GPIO Cleaned Up Safe and Released.")
 
 
-def _set_motor(motor, direction):
-    pins = MOTOR_PINS[motor]
+def _apply_hardware_pwm(motor, direction, speed_pct):
+    """
+    Direct low-level hardware voltage register writer.
+    """
+    p_in1 = pwm_objects[f"{motor}_in1"]
+    p_in2 = pwm_objects[f"{motor}_in2"]
+
     if direction == "fwd":
-        GPIO.output(pins["in1"], GPIO.HIGH)
-        GPIO.output(pins["in2"], GPIO.LOW)
+        p_in1.ChangeDutyCycle(speed_pct)
+        p_in2.ChangeDutyCycle(0)
     elif direction == "bwd":
-        GPIO.output(pins["in1"], GPIO.LOW)
-        GPIO.output(pins["in2"], GPIO.HIGH)
+        p_in1.ChangeDutyCycle(0)
+        p_in2.ChangeDutyCycle(speed_pct)
     else:  # stop
-        GPIO.output(pins["in1"], GPIO.LOW)
-        GPIO.output(pins["in2"], GPIO.LOW)
+        p_in1.ChangeDutyCycle(0)
+        p_in2.ChangeDutyCycle(0)
 
 
-def _all_stop():
-    for motor in MOTOR_PINS:
-        _set_motor(motor, "stop")
+def _update_all_wheels(speed_pct):
+    """
+    Applies the matching intermediate speed to all wheels simultaneously
+    based on the current structural direction states.
+    """
+    global current_dir_left, current_dir_right
+    _apply_hardware_pwm("left_front", current_dir_left, speed_pct)
+    _apply_hardware_pwm("left_rear", current_dir_left, speed_pct)
+    _apply_hardware_pwm("right_front", current_dir_right, speed_pct)
+    _apply_hardware_pwm("right_rear", current_dir_right, speed_pct)
 
 
-def _drive(left, right):
-    _set_motor("left_front", left)
-    _set_motor("left_rear", left)
-    _set_motor("right_front", right)
-    _set_motor("right_rear", right)
+def manage_motion_sequence(
+    target_speed, target_left_dir, target_right_dir, duration=0.4
+):
+    """
+    1. If the robot is moving, it first decelerates down to 0% cleanly.
+    2. Once safely at zero, it shifts the directional switches (no plugging).
+    3. It then accelerates smoothly up to your target velocity speed.
+    """
+    global current_speed, current_dir_left, current_dir_right
+
+    with ramp_lock:
+        # Step A: Safe Deceleration Phase (If currently moving)
+        if current_speed > 0:
+            steps = 8
+            sleep_time = 0.2 / steps
+            while current_speed > 0:
+                current_speed -= (
+                    (current_speed / steps) if current_speed > 5 else current_speed
+                )
+                current_speed = max(0, current_speed)
+                _update_all_wheels(int(current_speed))
+                time.sleep(sleep_time)
+
+            # Absolute mechanical rest pause to let motor coils settle
+            current_dir_left = "stop"
+            current_dir_right = "stop"
+            _update_all_wheels(0)
+            time.sleep(0.1)
+
+        # Step B: Shift Polarity Safely at Zero Velocity
+        current_dir_left = target_left_dir
+        current_dir_right = target_right_dir
+
+        # Step C: Smooth Acceleration Phase up to Target Power
+        if target_speed > 0:
+            steps = 10
+            sleep_time = duration / steps
+            step_increment = target_speed / steps
+            while current_speed < target_speed:
+                current_speed += step_increment
+                current_speed = min(target_speed, current_speed)
+                _update_all_wheels(int(current_speed))
+                time.sleep(sleep_time)
 
 
 def execute_command(action):
-    print(f"⚡ Executing Hardware Motor Action: {action}")
+    """
+    Threaded execution interface maps voice/SSH prompts to hardware pipelines.
+    Spawns background tasks so movement ramping doesn't stall OpenCV display frames.
+    """
+    global last_intended_command, obstacle_blocked
+
+    if action != "stop_motors":
+        last_intended_command = action
+
+    # If an obstacle is blocking the path, intercept and refuse forward movements
+    if obstacle_blocked and action == "move_forward":
+        print("🛑 Obstacle Block Active: Refusing forward request.")
+        return
+
+    print(f"⚡ Processing Managed Power Action: {action}")
     if action == "move_forward":
-        _drive("fwd", "fwd")
+        threading.Thread(
+            target=manage_motion_sequence, args=(80, "fwd", "fwd"), daemon=True
+        ).start()
     elif action == "move_backward":
-        _drive("bwd", "bwd")
+        threading.Thread(
+            target=manage_motion_sequence, args=(80, "bwd", "bwd"), daemon=True
+        ).start()
     elif action == "turn_left":
-        _drive("bwd", "fwd")
+        threading.Thread(
+            target=manage_motion_sequence, args=(65, "bwd", "fwd"), daemon=True
+        ).start()
     elif action == "turn_right":
-        _drive("fwd", "bwd")
+        threading.Thread(
+            target=manage_motion_sequence, args=(65, "fwd", "bwd"), daemon=True
+        ).start()
     elif action == "stop_motors":
-        _all_stop()
-    else:
-        print(f"Unknown action: {action}")
+        threading.Thread(
+            target=manage_motion_sequence, args=(0, "stop", "stop"), daemon=True
+        ).start()
 
 
 # ══════════════════════════════════════════════════════
-# TTS ENGINE
+# ULTRASONIC CRUISE WATCHDOG THREAD (ZERO CPU OVERHEAD)
+# ══════════════════════════════════════════════════════
+
+
+def measure_distance():
+    """
+    Calculates physical object proximity using high-precision hardware timestamps.
+    """
+    try:
+        GPIO.output(TRIG_PIN, GPIO.HIGH)
+        time.sleep(0.00001)  # 10 microsecond trigger pulse
+        GPIO.output(TRIG_PIN, GPIO.LOW)
+
+        pulse_start = time.time()
+        pulse_end = time.time()
+
+        # Timeout counters prevent hanging if the echo pulse is missed
+        timeout = time.time()
+        while GPIO.input(ECHO_PIN) == 0:
+            pulse_start = time.time()
+            if pulse_start - timeout > 0.05:
+                return 999.0
+
+        timeout = time.time()
+        while GPIO.input(ECHO_PIN) == 1:
+            pulse_end = time.time()
+            if pulse_end - timeout > 0.05:
+                return 999.0
+
+        pulse_duration = pulse_end - pulse_start
+        distance = (
+            pulse_duration * 17150
+        )  # Distance calculation based on speed of sound
+        return round(distance, 1)
+    except Exception:
+        return 999.0
+
+
+def ultrasonic_watchdog_thread():
+    """
+    Monitors obstacles continuously. Halts forward execution if blocked,
+    and automatically resumes movement when the path clears.
+    """
+    global obstacle_blocked, last_intended_command
+    time.sleep(2.5)  # Wait for display server to boot
+
+    print("🛰️ Ultrasonic Range Watchdog Active.")
+
+    while True:
+        dist = measure_distance()
+
+        if dist < OBSTACLE_THRESHOLD_CM:
+            if not obstacle_blocked:
+                # Obstacle detected for the first time
+                obstacle_blocked = True
+                with state_lock:
+                    state["status"] = "⚠️ OBSTACLE DETECTED"
+
+                # Halt forward movement if active
+                if last_intended_command == "move_forward":
+                    print("🚨 Proximity Alert! Initiating emergency auto-stop.")
+                    threading.Thread(
+                        target=manage_motion_sequence,
+                        args=(0, "stop", "stop"),
+                        daemon=True,
+                    ).start()
+        else:
+            if obstacle_blocked:
+                # Obstacle removed, path is clear
+                obstacle_blocked = False
+                with state_lock:
+                    state["status"] = "System Online"
+                print("✅ Path Clear. Reviewing auto-resume logs.")
+
+                # Resume moving forward if that was the last intended command
+                if last_intended_command == "move_forward":
+                    print("🚀 Auto-Resuming forward cruise sequence.")
+                    threading.Thread(
+                        target=manage_motion_sequence,
+                        args=(80, "fwd", "fwd"),
+                        daemon=True,
+                    ).start()
+
+        time.sleep(0.1)  # 10Hz polling rate limits CPU overhead
+
+
+# ══════════════════════════════════════════════════════
+# SYNCHRONOUS TTS ENGINE
 # ══════════════════════════════════════════════════════
 
 
 def speak_blocking(text):
-    """
-    Synchronous audio stream holder. Keeps text printed on screen until
-    audio output hardware completely completes the sentence string block.
-    """
     try:
         p1 = subprocess.Popen(
             ["espeak", "-s", "160", text, "--stdout"],
@@ -177,7 +368,7 @@ def ask_ai_brain(question):
             ],
             timeout=4.0,
         )
-        return completion.choices[0].message.content.strip()
+        return completion.choices.message.content.strip()
     except Exception as e:
         print(f"❌ Actual Error Stack Trace Info: {e}")
         return "Brain network timeout."
@@ -228,9 +419,7 @@ def process_text_command(text_input, source_type="Input"):
         if len(sub_sentences) > 1:
             for i, sentence in enumerate(sub_sentences):
                 with state_lock:
-                    state["scroll_offset"] = (
-                        i * 1
-                    )  # Shift layout lines up frame by frame
+                    state["scroll_offset"] = i * 1
                 speak_blocking(sentence)
         else:
             speak_blocking(ai_response)
@@ -272,7 +461,13 @@ def handle_greeting(face_count):
 
 # ── Input Streams Thread Pools ────────────────────────
 def voice_thread():
-    time.sleep(2)
+    """
+    Dual Audio Stream Pipeline.
+    1. Attempts to open physical USB Microphone via PyAudio.
+    2. Fallback: Opens a Linux Named Pipe to receive raw binary testing audio.
+    """
+    time.sleep(2)  # Allow camera and UI engine to initialize first
+
     model = Model(MODEL_PATH)
     rec = KaldiRecognizer(model, 16000)
 
@@ -280,6 +475,7 @@ def voice_thread():
     stream = None
     fifo_file = None
 
+    # 🎙️ Try connecting to physical hardware microphone first
     try:
         p = pyaudio.PyAudio()
         stream = p.open(
@@ -291,33 +487,39 @@ def voice_thread():
         )
         with state_lock:
             state["status"] = "AURA Mic Active"
-        print("Hardware Audio Input bound.")
+        print("🎙️ Live Hardware Microphone stream initialized successfully.")
     except Exception as e:
+        # 🧪 FALLBACK: Trigger file pipe channel if mic is absent
         use_hardware_mic = False
         with state_lock:
             state["status"] = "AURA Sim Mic"
-        print(f"Hardware mic not found ({e}). Connecting to virtual FIFO...")
+        print(
+            f"⚠️ Mic missing ({e}). Activating Sim Pipe: /home/aura/AURA/mic_sim.pipe"
+        )
+
+        # Open the simulation audio named pipe in Read-Binary mode
         try:
             fifo_file = open("/home/aura/AURA/mic_sim.pipe", "rb")
-            print("Virtual Audio Pipe linked.")
         except Exception as pipe_err:
-            print(f"Pipe failed: {pipe_err}")
-            with state_lock:
-                state["status"] = "Audio Error"
+            print(f"❌ Failed to open mic sim pipe: {pipe_err}")
             return
 
+    # Main speech parsing engine loop
     while True:
         try:
             if use_hardware_mic:
+                # Read chunks directly from the physical USB driver chip
                 data = stream.read(4000, exception_on_overflow=False)
             else:
+                # Read chunks directly from your simulated terminal audio injector
                 data = fifo_file.read(8000)
                 if len(data) == 0:
-                    time.sleep(0.01)
+                    time.sleep(0.01)  # Stop thread from pinning CPU at 100% when idle
                     continue
         except IOError:
             continue
 
+        # Feed extracted data frames straight into the Vosk text engine
         if rec.AcceptWaveform(data):
             result = json.loads(rec.Result())
             text = result.get("text", "").lower().strip()
@@ -346,7 +548,6 @@ def draw_scaled_multiline_text(
     thickness,
     scroll_offset,
 ):
-    # Font contraction metrics configuration based on text density
     if len(text) > 60:
         scale = 0.36
         line_height = 14
@@ -369,13 +570,12 @@ def draw_scaled_multiline_text(
     if current_line:
         lines.append(current_line.strip())
 
-    # Crop and index lines array based on scroll_offset paged instructions
     visible_lines = lines[scroll_offset:]
     y = start_y
     for i, line in enumerate(visible_lines):
-        if i >= 2:  # Bound to maximum 2 rows inside the 80 pixel boundary
+        if i >= 2:
             break
-        cv2.putTextBox = cv2.putText(
+        cv2.putText(
             frame, line, (start_x, y), font, scale, (0, 255, 0), thickness, cv2.LINE_AA
         )
         y += line_height
@@ -444,13 +644,13 @@ def draw_overlay(frame, faces, heard, response, status, display_active, scroll_o
 
 # ── Main Application Engine ───────────────────────────
 def main():
-    # 👈 FIX: Call the initialization line immediately inside main loop startup!
+    # Call the initialization line immediately inside main loop startup
     gpio_setup()
 
     face_cascade = cv2.CascadeClassifier(CASCADE_PATH)
     picam2 = Picamera2()
     config = picam2.create_preview_configuration(
-        main={"size": (320, 240), "format": "RGB888"}
+        main={"size": (320, 240), "format": "BGR888"}
     )
     picam2.configure(config)
     picam2.start()
