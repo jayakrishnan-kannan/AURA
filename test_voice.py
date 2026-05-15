@@ -6,11 +6,11 @@ import wave
 import json
 import os
 
-MODEL_PATH = "/home/aura/AURA/model/vosk-model-small-en-in-0.4"
+MODEL_PATH = "/home/aura/AURA/model/vosk-model-small-en-us-0.15"
 
 # ── Create a test wav using espeak ─────────────────────
 # This generates "move forward" as a wav file to feed into vosk
-#os.system('espeak-ng "move forward" -w /home/aura/AURA/test_input.wav')
+os.system('espeak-ng "move forward" -w /home/aura/AURA/test_input.wav')
 
 # ── Load model ─────────────────────────────────────────
 model = Model(MODEL_PATH)
@@ -32,11 +32,11 @@ print(f"STT heard: '{result_text}'")
 
 # ── Intent matching ────────────────────────────────────
 COMMANDS = {
-    "forward":  "move_forward",
+    "forward": "move_forward",
     "backward": "move_backward",
-    "left":     "turn_left",
-    "right":    "turn_right",
-    "stop":     "stop_motors",
+    "left": "turn_left",
+    "right": "turn_right",
+    "stop": "stop_motors",
 }
 
 matched = None
