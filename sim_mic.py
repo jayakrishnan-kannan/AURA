@@ -3,7 +3,8 @@ import wave
 import time
 import os
 
-WAV_PATH = "/home/aura/AURA/test_input.wav"
+# WAV_PATH = "/home/aura/AURA/test_recoding1.wav"
+WAV_PATH = "/home/aura/AURA/test_1.wav"
 PIPE_PATH = "/home/aura/AURA/mic_sim.pipe"
 
 print("🎙️ Virtual Microphone Pipeline Simulator Initialized.")
