@@ -6,6 +6,7 @@ import time
 import socket
 import json
 import subprocess
+import numpy as np
 import logging
 from vosk import Model, KaldiRecognizer
 from groq import Groq
@@ -47,57 +48,87 @@ COMMANDS = {
 }
 
 # ── Full JEC & ECE Local Custom Response Cache Matrix ──
+# ── Enhanced Local Cache (Indian Accent & Phonetic Speech Fixes) ──
 LOCAL_QA_CACHE = {
-    # --- AURA General Persona Questions ---
-    "name": "Hello, I am AURA, Autonomous Unified Robotic Assistant.",
-    "hello": "Hello, how can I assist you?",
-    "hi": "Hi, nice to meet you.",
+    # ── 1. Team & Creator Specific Questions (High Priority Lookup) ──
+    "who is your creator": "I was created by a team of talented engineers at Jeppiaar Engineering College. My team members include Akula Mahalakshmi, Alena Biju, Janani P, and Kaviya A who contributed to my development.",
+    "who made you": "I was created by a team of talented engineers at Jeppiaar Engineering College. My team members include Akula Mahalakshmi, Alena Biju, Janani P, and Kaviya A who contributed to my development.",
+    "who built you": "I was created by a team of talented engineers at Jeppiaar Engineering College. My team members include Akula Mahalakshmi, Alena Biju, Janani P, and Kaviya A who contributed to my development.",
+    "team members": "My team members include Akula Mahalakshmi, Alena Biju, Janani P, and Kaviya A from the Electronics and Communication Engineering department.",
+    # ── 2. Hardware Motor Commands ──
+    "move forward": "Moving forward.",
+    "move backward": "Moving backward.",
+    "forward": "Moving forward.",
+    "left": "turn_left",
+    "right": "turn_right",
+    "front": "Moving forward.",
+    "backward": "Moving backward.",
+    "move back": "Moving backward.",
+    "stop": "Stopping the robot.",
+    # ── 3. AURA General Persona ──
+    "what can you do": "I can provide information, assist visitors, and guide users inside the campus.",
+    "what are your features": "My features include voice interaction, face detection, robotic movement, and smart assistance.",
+    "your features": "My features include voice interaction, face detection, robotic movement, and smart assistance.",
+    "your purpose": "I am designed to assist users through voice interaction and robotic automation.",
+    "detect faces": "Yes, I can detect faces using my camera module and OpenCV.",
     "good morning": "Good morning. How can I help you today?",
     "good evening": "Good evening. Hope you are doing well.",
-    "what can you do": "I can provide information, assist visitors, and guide users inside the campus.",
-    "features": "My features include voice interaction, face detection, robotic movement, and smart assistance.",
-    "purpose": "I am designed to assist users through voice interaction and robotic automation.",
-    "detect faces": "Yes, I can detect faces using my camera module and OpenCV.",
-    "move": "Yes, I can move based on commands.",
     "thank you": "You are welcome.",
     "goodbye": "Goodbye. Have a nice day.",
     "ready": "Hello, I am AURA. How can I assist you today?",
-    # --- Hardware Motor Movements ---
-    "move forward": "Moving forward.",
-    "move backward": "Moving backward.",
-    # --- Jeppiaar Engineering College (JEC) ---
+    "name": "Hello, I am AURA, Autonomous Unified Robotic Assistant.",
+    "hello": "Hello, how can I assist you?",
+    "hi": "Hi, nice to meet you.",
+    "move": "Yes, I can move based on commands.",
+    # ── 4. Jeppiaar Engineering College (JEC) Metrics & Indian Accent Variations ──
+    "tell me about j e c": "Jeppiaar Engineering College is one of the leading autonomous engineering colleges in Chennai providing quality education, placement support, research opportunities, and modern infrastructure.",
+    "tell me about jeppiyar college": "Jeppiaar Engineering College is one of the leading autonomous engineering colleges in Chennai providing quality education, placement support, research opportunities, and modern infrastructure.",
+    "about j e c": "Jeppiaar Engineering College is one of the leading autonomous engineering colleges in Chennai providing quality education, placement support, research opportunities, and modern infrastructure.",
     "about jec": "Jeppiaar Engineering College is one of the leading autonomous engineering colleges in Chennai providing quality education, placement support, research opportunities, and modern infrastructure.",
-    "tell me about jec": "Jeppiaar Engineering College is one of the leading autonomous engineering colleges in Chennai providing quality education, placement support, research opportunities, and modern infrastructure.",
+    "about jack": "Jeppiaar Engineering College is one of the leading autonomous engineering colleges in Chennai providing quality education, placement support, research opportunities, and modern infrastructure.",  # Vosk phonetic fallback
+    "founded j e c": "Colonel Dr. Jeppiaar founded Jeppiaar Engineering College, and now Chancellor Regena J Murali Mam is taking the institution to the next level through innovation, academic excellence, and student development.",
     "founded jec": "Colonel Dr. Jeppiaar founded Jeppiaar Engineering College, and now Chancellor Regena J Murali Mam is taking the institution to the next level through innovation, academic excellence, and student development.",
     "who founded": "Colonel Dr. Jeppiaar founded Jeppiaar Engineering College, and now Chancellor Regena J Murali Mam is taking the institution to the next level through innovation, academic excellence, and student development.",
     "chancellor": "Regena J Murali Mam is the Chancellor of Jeppiaar Engineering College.",
     "autonomous": "Yes, JEC is an autonomous institution.",
+    "jec located": "JEC is located in Semmancheri, Chennai.",
     "located": "JEC is located in Semmancheri, Chennai.",
     "courses": "JEC offers courses including CSE, AI and DS, AI and ML, IT, ECE, EEE, Mechanical, Civil, and Biotechnology.",
     "placement": "Yes, the college provides placement assistance and career training.",
     "hostel": "Yes, hostel facilities are available for students staying in campus.",
-    "hostile": "Yes, hostel facilities are available for students staying in campus.",  # Speech fix
+    "hostile": "Yes, hostel facilities are available for students staying in campus.",  # Indian vocal accent adjustment
     "transport": "Yes, transportation facilities are available for day scholars.",
     "food": "Yes, food facilities are available for both hostel students and day scholars.",
-    # --- ECE Department ---
+    # ── 5. ECE Department Framework ──
+    "electronics and communication department": "The ECE department of Jeppiaar Engineering College is one of the best departments in the college, known for quality education, experienced faculty, advanced laboratories, innovative projects, and accredited programs in electronics, communication, networking, IoT, and robotics.",
+    "electronics and communication": "The ECE department of Jeppiaar Engineering College is one of the best departments in the college, known for quality education, experienced faculty, advanced laboratories, innovative projects, and accredited programs in electronics, communication, networking, IoT, and robotics.",
+    "e c e department": "The ECE department of Jeppiaar Engineering College is one of the best departments in the college, known for quality education, experienced faculty, advanced laboratories, innovative projects, and accredited programs in electronics, communication, networking, IoT, and robotics.",
     "ece department": "The ECE department of Jeppiaar Engineering College is one of the best departments in the college, known for quality education, experienced faculty, advanced laboratories, innovative projects, and accredited programs in electronics, communication, networking, IoT, and robotics.",
     "accredited": "Yes, the ECE department is accredited and provides quality technical education.",
     "hod cabin": "The HOD cabin is on the first floor of the ECE department.",
     "staff room": "The ECE staff room is on the second floor.",
-    # --- Directions ---
-    "library": "The library is located in the blue building.",
-    "auditorium": "The auditorium is on the first floor of the blue building.",
-    "biotechnology": "The biotechnology department is beside the blue building on the right side.",
-    "bio technology": "The biotechnology department is beside the blue building on the right side.",  # Speech fix
-    "mess": "The mess is located on the left side of the blue building.",
+    # ── 6. Structural Campus Directions (Compact Key Mappings) ──
+    "information technology department": "The IT department is opposite to the ECE department.",
+    "information technology": "The IT department is opposite to the ECE department.",
     "it department": "The IT department is opposite to the ECE department.",
-    "ai and ds": "The AI and DS department is beside the ECE department on the left side.",
+    "id department": "The IT department is opposite to the ECE department.",
+    "i d department": "The IT department is opposite to the ECE department.",
+    "computer science and engineering": "The CSE department is beside the ECE department.",
+    "computer science": "The CSE department is beside the ECE department.",
     "cse department": "The CSE department is beside the ECE department.",
-    "placement cell": "The placement cell is located behind the ECE department.",
+    "biotechnology": "The biotechnology department is beside the blue building on the right side.",
+    "bio technology": "The biotechnology department is beside the blue building on the right side.",  # Speech splitting correction
+    "ai and ds": "The AI and DS department is beside the ECE department on the left side.",
+    "a i and d s": "The AI and DS department is beside the ECE department on the left side.",
     "admission office": "The admission office is located near the entrance on the right side of ECE.",
-    "canteen": "The canteen is located near the academic block.",
+    "placement cell": "The placement cell is located behind the ECE department.",
     "seminar hall": "The seminar hall is located in the blue building.",
+    "auditorium": "The auditorium is on the first floor of the blue building.",
+    "canteen": "The canteen is located near the academic block.",
+    "library": "The library is located in the blue building.",
+    "mess": "The mess is located on the left side of the blue building.",
 }
+
 
 # ── Shared State Architecture ─────────────────────────
 state = {
@@ -344,12 +375,17 @@ def speak(text):
 
 def ask_ai_brain(question):
     clean_question = question.strip().lower()
-    for key, local_answer in LOCAL_QA_CACHE.items():
+
+    sorted_keys = sorted(LOCAL_QA_CACHE.keys(), key=len, reverse=True)
+
+    for key in sorted_keys:
         if key in clean_question:
             print(
                 f'📦 [LOCAL CACHE MATCH ACQUIRED]: Found keyword token "{key}" offline.'
             )
-            return local_answer
+            return LOCAL_QA_CACHE[key]
+
+    # --- Cloud Fallback Gate ---
     try:
         client = Groq(api_key=GROQ_API_KEY)
         completion = client.chat.completions.create(
@@ -535,7 +571,7 @@ def generate_web_frames():
         yield (
             b"--frame\r\n" b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n"
         )
-        time.sleep(0.04)  # ~25 FPS sync pacing loop
+        time.sleep(0.06)  # ~25 FPS sync pacing loop
 
 
 @app.route("/video_feed")
@@ -546,37 +582,92 @@ def video_feed():
 
 
 # ── Input Streams Thread Pools ────────────────────────
+def get_usb_mic_info(p):
+    """Finds the index and default sample rate of the connected USB Microphone."""
+    for i in range(p.get_device_count()):
+        dev_info = p.get_device_info_by_index(i)
+        name = dev_info.get("name", "").lower()
+        # Look for typical USB mic keywords
+        if "usb" in name or "mic" in name or "input" in name:
+            if dev_info.get("maxInputChannels", 0) > 0:
+                return i, int(dev_info.get("defaultSampleRate", 44100))
+    return None, 16000  # Fallback defaults
+
+
 def voice_thread():
-    time.sleep(2)
-    model = Model(MODEL_PATH)
-    rec = KaldiRecognizer(model, 16000)
+    time.sleep(2.0)
+    print("🎤 Initialising Voice Recognition Engine...", flush=True)
+
+    try:
+        model = Model(MODEL_PATH)
+        phrase_list = list(LOCAL_QA_CACHE.keys()) + [
+            "forward",
+            "back",
+            "left",
+            "right",
+            "stop",
+        ]
+
+        grammar_json = json.dumps(phrase_list)
+
+        rec = KaldiRecognizer(model, 16000, grammar_json)
+    except Exception as e:
+        print(f"❌ Vosk Model Error: {e}", flush=True)
+        return
+
     use_hardware_mic = True
     stream = None
     fifo_file = None
+    hw_rate = 16000
     try:
         p = pyaudio.PyAudio()
+        mic_index, hw_rate = get_usb_mic_info(p)
+
+        print(
+            f"🎙️ Found Mic at index {mic_index}. Native HW Rate: {hw_rate}Hz",
+            flush=True,
+        )
+
+        # Open the hardware stream using its exact native rate to prevent the 9997 crash
         stream = p.open(
             format=pyaudio.paInt16,
             channels=1,
-            rate=16000,
+            rate=hw_rate,
             input=True,
-            frames_per_buffer=4000,
+            input_device_index=mic_index,  # Force the script to use the USB hardware
+            frames_per_buffer=8000 if hw_rate > 16000 else 4000,
         )
         with state_lock:
             state["status"] = "AURA Mic Active"
-    except Exception:
+
+    except Exception as e:
+        # 3. Print the EXACT error so you know why it failed
+        print(f"❌ PyAudio Hardware initialization failed: {e}", flush=True)
         use_hardware_mic = False
         with state_lock:
             state["status"] = "AURA Sim Mic"
         try:
             fifo_file = open("/home/aura/AURA/mic_sim.pipe", "rb")
-        except Exception:
+        except Exception as pipe_err:
+            print(f"❌ Sim Pipe failed: {pipe_err}", flush=True)
             return
+
+    print(f"🎤 Voice Recognition Thread Active: {state['status']}", flush=True)
 
     while True:
         try:
             if use_hardware_mic:
-                data = stream.read(4000, exception_on_overflow=False)
+                raw_data = stream.read(
+                    8000 if hw_rate > 16000 else 4000, exception_on_overflow=False
+                )
+                if hw_rate != 16000:
+                    audio_data = np.frombuffer(raw_data, dtype=np.int16)
+                    # Downsample logic using lightweight numpy stepping (keeps CPU impact low)
+                    step = hw_rate // 16000
+                    resampled_data = audio_data[::step]
+                    data = resampled_data.tobytes()
+                else:
+                    data = raw_data
             else:
                 data = fifo_file.read(8000)
                 if len(data) == 0:
@@ -599,6 +690,8 @@ def optional_ssh_thread():
                 clean_command = line.strip().lower()
                 if clean_command:
                     process_text_command(clean_command, source_type="SSH")
+
+        time.sleep(0.1)
 
 
 # ── Micro-HUD Display Overlay Engine with Auto-Scaling ──
@@ -681,8 +774,8 @@ def draw_overlay(frame, faces, heard, response, status, display_active, scroll_o
     if display_active or heard or response:
         hud_h = 80
         overlay = frame.copy()
-        cv2.rectangle(overlay, (0, h - hud_h), (w, h), (0, 255, 255), -1)
-        cv2.addWeighted(overlay, 0.65, frame, 0.35, 0, frame)
+        cv2.rectangle(overlay, (0, h - hud_h), (w, h), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.40, frame, 0.35, 0, frame)
         font = cv2.FONT_HERSHEY_SIMPLEX
         if heard:
             cv2.putText(
@@ -706,7 +799,7 @@ def draw_overlay(frame, faces, heard, response, status, display_active, scroll_o
 
     ip_label = f"IP: {device_ip}"
     cv2.putText(
-        frame, ip_label, (w - 170, 20), font, 0.30, (0, 0, 0), 1, cv2.LINE_AA
+        frame, ip_label, (w - 170, 20), font, 0.30, (0, 255, 255), 1, cv2.LINE_AA
     )  # Cyan color for visibility
 
     # Push the status string down slightly or shift left to avoid overlap
@@ -768,15 +861,17 @@ def main():
             frame = picam2.capture_array()
 
             if frame_count % 5 == 0:
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                small_gray = cv2.resize(
+                    frame, (160, 120), interpolation=cv2.INTER_NEAREST
+                )
+                gray = cv2.cvtColor(small_gray, cv2.COLOR_BGR2GRAY)
                 detected_boxes = face_cascade.detectMultiScale(
-                    gray, scaleFactor=1.3, minNeighbors=5, minSize=(30, 30)
+                    gray, scaleFactor=1.3, minNeighbors=5, minSize=(15, 15)
                 )
-                local_faces = (
-                    [tuple(b) for b in detected_boxes]
-                    if len(detected_boxes) > 0
-                    else []
-                )
+                local_faces = []
+                for x, y, fw, fh in detected_boxes:
+                    local_faces.append((x * 2, y * 2, fw * 2, fh * 2))
+
                 with state_lock:
                     state["faces"] = local_faces
                 handle_greeting(len(local_faces))
