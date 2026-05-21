@@ -27,16 +27,16 @@ GROQ_API_KEY = ""
 
 # ── Motor GPIO Pin Map (BCM Numbering) ─────────────────
 MOTOR_PINS = {
-    "left_front": {"in1": 5, "in2": 6},
-    "left_rear": {"in1": 12, "in2": 13},
+    "left_front": {"in1": 5, "in2": 6},  # added
+    "left_rear": {"in1": 12, "in2": 13},  # added
     "right_front": {"in1": 19, "in2": 16},
-    "right_rear": {"in1": 26, "in2": 20},
+    "right_rear": {"in1": 26, "in2": 20},  # added
 }
 
 # ── Ultrasonic Sensor GPIO Pin Map (BCM Numbering) ─────
-TRIG_PIN = 27
-ECHO_PIN = 17
-OBSTACLE_THRESHOLD_CM = 20.0
+TRIG_PIN = 22
+ECHO_PIN = 23
+OBSTACLE_THRESHOLD_CM = 75.0
 
 # ── Voice / SSH Command Map ────────────────────────────
 COMMANDS = {
@@ -154,6 +154,7 @@ ramp_lock = threading.Lock()
 # ── Ultrasonic Watchdog State Trackers ────────────────
 last_intended_command = "stop_motors"
 obstacle_blocked = False
+user_stopped_manually = False  # True when user says stop — blocks auto-resume
 
 # ── 👈 NEW: Flask Web Server Frame Buffer ──────────────
 app = Flask(__name__)
@@ -249,8 +250,14 @@ def manage_motion_sequence(
 
 
 def execute_command(action):
-    global last_intended_command, obstacle_blocked
-    if action != "stop_motors":
+    global last_intended_command, obstacle_blocked, user_stopped_manually
+    if action == "stop_motors":
+        # User explicitly stopped — block ultrasonic auto-resume
+        user_stopped_manually = True
+        last_intended_command = "stop_motors"
+    else:
+        # Any movement command clears the manual stop flag
+        user_stopped_manually = False
         last_intended_command = action
     if obstacle_blocked and action == "move_forward":
         print("🛑 Obstacle Block Active: Refusing forward request.")
@@ -301,17 +308,23 @@ def measure_distance():
 
 
 def ultrasonic_watchdog_thread():
-    global obstacle_blocked, last_intended_command
+    global obstacle_blocked, last_intended_command, user_stopped_manually
     time.sleep(2.5)
     print("🛰️ Ultrasonic Range Watchdog Active.")
     while True:
         dist = measure_distance()
+        # print(f"📏 Ultrasonic Sensor Reading: {dist} cm")
         if dist < OBSTACLE_THRESHOLD_CM:
             if not obstacle_blocked:
                 obstacle_blocked = True
                 with state_lock:
                     state["status"] = "⚠️ OBSTACLE"
-                if last_intended_command == "move_forward":
+                # Only auto-stop if robot was actively moving forward
+                # Do NOT auto-stop if user already said stop
+                if (
+                    last_intended_command == "move_forward"
+                    and not user_stopped_manually
+                ):
                     print("🚨 Proximity Alert! Initiating emergency auto-stop.")
                     threading.Thread(
                         target=manage_motion_sequence,
@@ -323,14 +336,25 @@ def ultrasonic_watchdog_thread():
                 obstacle_blocked = False
                 with state_lock:
                     state["status"] = "System Online"
-                print("✅ Path Clear. Reviewing auto-resume logs.")
-                if last_intended_command == "move_forward":
-                    print("🚀 Auto-Resuming forward cruise sequence.")
+                print("✅ Path Clear.")
+
+                # ── KEY FIX: Only auto-resume if:
+                #    1. Last command was move_forward (user wanted to move)
+                #    2. User did NOT manually stop (user_stopped_manually=False)
+                # If user said stop → respect that, never auto-resume
+                if (
+                    last_intended_command == "move_forward"
+                    and not user_stopped_manually
+                ):
+                    print("🚀 Auto-Resuming forward cruise — user intent was forward.")
                     threading.Thread(
                         target=manage_motion_sequence,
                         args=(80, "fwd", "fwd"),
                         daemon=True,
                     ).start()
+                else:
+                    print("⏸️ Path clear but user stopped manually — staying stopped.")
+
         time.sleep(0.1)
 
 
