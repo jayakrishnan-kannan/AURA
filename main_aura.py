@@ -1,17 +1,17 @@
-import pyaudio
-from picamera2 import Picamera2
 import cv2
+from flask import Flask, Response, render_template_string, request
+from groq import Groq
+import json
+import logging
+import numpy as np
+from picamera2 import Picamera2
+import pyaudio
+import RPi.GPIO as GPIO
+import socket
+import subprocess
 import threading
 import time
-import socket
-import json
-import subprocess
-import numpy as np
-import logging
 from vosk import Model, KaldiRecognizer
-from groq import Groq
-import RPi.GPIO as GPIO
-from flask import Flask, Response, render_template_string, request
 
 # ── Suppress Annoying 404/Muted HTTP Logs ───────────────
 log = logging.getLogger("werkzeug")
@@ -22,8 +22,9 @@ DISPLAY_W, DISPLAY_H = 800, 480
 CASCADE_PATH = "/home/aura/AURA/model/haarcascade_frontalface_default.xml"
 MODEL_PATH = "/home/aura/AURA/model/vosk-model-small-en-in-0.4"
 PIPE_PATH = "/home/aura/AURA/ssh_bridge.pipe"
+MOVEMENT_SPEED = 80  # Base speed percentage for movements (0-100)
 
-GROQ_API_KEY = ""
+GROQ_API_KEY = ""  # Add your GROQ API key here for cloud fallback responses. Get it from https://www.groq.com/
 
 # ── Motor GPIO Pin Map (BCM Numbering) ─────────────────
 MOTOR_PINS = {
@@ -36,7 +37,7 @@ MOTOR_PINS = {
 # ── Ultrasonic Sensor GPIO Pin Map (BCM Numbering) ─────
 TRIG_PIN = 22
 ECHO_PIN = 23
-OBSTACLE_THRESHOLD_CM = 75.0
+OBSTACLE_THRESHOLD_CM = 30.0
 
 # ── Voice / SSH Command Map ────────────────────────────
 COMMANDS = {
@@ -52,6 +53,8 @@ COMMANDS = {
 LOCAL_QA_CACHE = {
     # ── 1. Team & Creator Specific Questions (High Priority Lookup) ──
     "who is your creator": "I was created by a team of talented engineers at Jeppiaar Engineering College. My team members include Akula Mahalakshmi, Alena Biju, Janani P, and Kaviya A who contributed to my development.",
+    "creator": "I was created by a team of talented engineers at Jeppiaar Engineering College. My team members include Akula Mahalakshmi, Alena Biju, Janani P, and Kaviya A who contributed to my development.",
+    "who designed you": "I was created by a team of talented engineers at Jeppiaar Engineering College. My team members include Akula Mahalakshmi, Alena Biju, Janani P, and Kaviya A who contributed to my development.",
     "who made you": "I was created by a team of talented engineers at Jeppiaar Engineering College. My team members include Akula Mahalakshmi, Alena Biju, Janani P, and Kaviya A who contributed to my development.",
     "who built you": "I was created by a team of talented engineers at Jeppiaar Engineering College. My team members include Akula Mahalakshmi, Alena Biju, Janani P, and Kaviya A who contributed to my development.",
     "team members": "My team members include Akula Mahalakshmi, Alena Biju, Janani P, and Kaviya A from the Electronics and Communication Engineering department.",
@@ -93,7 +96,7 @@ LOCAL_QA_CACHE = {
     "autonomous": "Yes, JEC is an autonomous institution.",
     "jec located": "JEC is located in Semmancheri, Chennai.",
     "located": "JEC is located in Semmancheri, Chennai.",
-    "courses": "JEC offers courses including CSE, AI and DS, AI and ML, IT, ECE, EEE, Mechanical, Civil, and Biotechnology.",
+    "courses": "JEC offers courses including CSE, AI and DS, AI and ML, IT, Electronics and Communication Engineering, Electrical and Electronics Engineering, Mechanical, Civil, and Biotechnology.",
     "placement": "Yes, the college provides placement assistance and career training.",
     "hostel": "Yes, hostel facilities are available for students staying in campus.",
     "hostile": "Yes, hostel facilities are available for students staying in campus.",  # Indian vocal accent adjustment
@@ -106,6 +109,7 @@ LOCAL_QA_CACHE = {
     "ece department": "The ECE department of Jeppiaar Engineering College is one of the best departments in the college, known for quality education, experienced faculty, advanced laboratories, innovative projects, and accredited programs in electronics, communication, networking, IoT, and robotics.",
     "accredited": "Yes, the ECE department is accredited and provides quality technical education.",
     "hod cabin": "The HOD cabin is on the first floor of the ECE department.",
+    "department cabin": "The HOD cabin is on the first floor of the ECE department.",
     "staff room": "The ECE staff room is on the second floor.",
     # ── 6. Structural Campus Directions (Compact Key Mappings) ──
     "information technology department": "The IT department is opposite to the ECE department.",
@@ -114,12 +118,14 @@ LOCAL_QA_CACHE = {
     "id department": "The IT department is opposite to the ECE department.",
     "i d department": "The IT department is opposite to the ECE department.",
     "computer science and engineering": "The CSE department is beside the ECE department.",
+    "computer science engineering": "The CSE department is beside the ECE department.",
     "computer science": "The CSE department is beside the ECE department.",
     "cse department": "The CSE department is beside the ECE department.",
     "biotechnology": "The biotechnology department is beside the blue building on the right side.",
     "bio technology": "The biotechnology department is beside the blue building on the right side.",  # Speech splitting correction
     "ai and ds": "The AI and DS department is beside the ECE department on the left side.",
     "a i and d s": "The AI and DS department is beside the ECE department on the left side.",
+    "Artificial Intelligence and Data Science": "The AI and DS department is beside the ECE department on the left side.",
     "admission office": "The admission office is located near the entrance on the right side of ECE.",
     "placement cell": "The placement cell is located behind the ECE department.",
     "seminar hall": "The seminar hall is located in the blue building.",
@@ -156,7 +162,7 @@ last_intended_command = "stop_motors"
 obstacle_blocked = False
 user_stopped_manually = False  # True when user says stop — blocks auto-resume
 
-# ── 👈 NEW: Flask Web Server Frame Buffer ──────────────
+# ──  Flask Web Server Frame Buffer ──────────────
 app = Flask(__name__)
 global_web_frame = None
 frame_buffer_lock = threading.Lock()
@@ -252,7 +258,6 @@ def manage_motion_sequence(
 def execute_command(action):
     global last_intended_command, obstacle_blocked, user_stopped_manually
     if action == "stop_motors":
-        # User explicitly stopped — block ultrasonic auto-resume
         user_stopped_manually = True
         last_intended_command = "stop_motors"
     else:
@@ -265,19 +270,27 @@ def execute_command(action):
     print(f"⚡ Processing Managed Power Action: {action}")
     if action == "move_forward":
         threading.Thread(
-            target=manage_motion_sequence, args=(80, "fwd", "fwd"), daemon=True
+            target=manage_motion_sequence,
+            args=(MOVEMENT_SPEED, "fwd", "fwd"),
+            daemon=True,
         ).start()
     elif action == "move_backward":
         threading.Thread(
-            target=manage_motion_sequence, args=(80, "bwd", "bwd"), daemon=True
+            target=manage_motion_sequence,
+            args=(MOVEMENT_SPEED, "bwd", "bwd"),
+            daemon=True,
         ).start()
     elif action == "turn_left":
         threading.Thread(
-            target=manage_motion_sequence, args=(65, "bwd", "fwd"), daemon=True
+            target=manage_motion_sequence,
+            args=(MOVEMENT_SPEED, "bwd", "fwd"),
+            daemon=True,
         ).start()
     elif action == "turn_right":
         threading.Thread(
-            target=manage_motion_sequence, args=(65, "fwd", "bwd"), daemon=True
+            target=manage_motion_sequence,
+            args=(MOVEMENT_SPEED, "fwd", "bwd"),
+            daemon=True,
         ).start()
     elif action == "stop_motors":
         threading.Thread(
@@ -349,7 +362,7 @@ def ultrasonic_watchdog_thread():
                     print("🚀 Auto-Resuming forward cruise — user intent was forward.")
                     threading.Thread(
                         target=manage_motion_sequence,
-                        args=(80, "fwd", "fwd"),
+                        args=(MOVEMENT_SPEED, "fwd", "fwd"),
                         daemon=True,
                     ).start()
                 else:
@@ -509,7 +522,7 @@ def handle_greeting(face_count):
 
 
 # ══════════════════════════════════════════════════════
-# FLASK WIRELESS COCKPIT SERVER (🕹️ FULLY INTEGRATED)
+# FLASK WIRELESS COCKPIT SERVER
 # ══════════════════════════════════════════════════════
 
 HTML_COCKPIT_TEMPLATE = """
@@ -574,7 +587,6 @@ def web_control():
     action = request.args.get("action")
     if action:
         if action in ["forward", "back", "left", "right", "stop"]:
-            # Route movement pads strictly to local hardware actuators
             execute_command(COMMANDS[action])
         else:
             process_text_command(action, source_type="Web")
@@ -652,7 +664,6 @@ def voice_thread():
             flush=True,
         )
 
-        # Open the hardware stream using its exact native rate to prevent the 9997 crash
         stream = p.open(
             format=pyaudio.paInt16,
             channels=1,
@@ -665,7 +676,6 @@ def voice_thread():
             state["status"] = "AURA Mic Active"
 
     except Exception as e:
-        # 3. Print the EXACT error so you know why it failed
         print(f"❌ PyAudio Hardware initialization failed: {e}", flush=True)
         use_hardware_mic = False
         with state_lock:
@@ -824,9 +834,7 @@ def draw_overlay(frame, faces, heard, response, status, display_active, scroll_o
     ip_label = f"IP: {device_ip}"
     cv2.putText(
         frame, ip_label, (w - 170, 20), font, 0.30, (0, 255, 255), 1, cv2.LINE_AA
-    )  # Cyan color for visibility
-
-    # Push the status string down slightly or shift left to avoid overlap
+    )
     cv2.putText(
         frame, status, (w - 170, 38), font, 0.30, (200, 200, 200), 1, cv2.LINE_AA
     )
@@ -931,6 +939,9 @@ def main():
             display_frame = cv2.resize(
                 frame, (DISPLAY_W, DISPLAY_H), interpolation=cv2.INTER_LINEAR
             )
+            cv2.rotate(
+                display_frame, cv2.ROTATE_180, display_frame
+            )  # Rotate for correct orientation
             cv2.imshow("AURA", display_frame)
 
             # Safe interactive breakout trigger on local keyboard tap 'q'
